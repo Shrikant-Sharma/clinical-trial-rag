@@ -5,7 +5,7 @@ studies. Built end-to-end: data ingestion, recursive chunking, biomedical
 embeddings, FAISS retrieval, LLM generation with citations, two-layer safety,
 and RAGAS-equivalent evaluation across three chunk sizes.
 
-**Live demo:** *[Streamlit URL — deploy pending]*
+**Live demo:** [shrikant-clinical-rag.streamlit.app](https://shrikant-clinical-rag.streamlit.app/)
 **Author:** Shrikant Sharma | [LinkedIn](https://www.linkedin.com/in/shrikant-sharma/)
 
 ---
