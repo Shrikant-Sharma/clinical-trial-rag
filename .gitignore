@@ -1,9 +1,31 @@
+# Environment
 .env
-data/
-*.faiss
-*.pkl
+.streamlit/secrets.toml
+
+# Data and model artifacts (regenerable from notebooks)
+data/**/*.pkl
+data/**/*.npy
+data/**/*.index
+data/**/*.faiss
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# Jupyter
 .ipynb_checkpoints/
+
+# Virtual environments
 .venv/
 venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
