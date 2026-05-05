@@ -62,6 +62,23 @@ roughly 1.5 seconds end-to-end (PubMedBERT loaded once at app startup via
 
 ---
 
+## Example outputs
+
+Two representative interactions from the deployed Streamlit interface — a
+successful cited answer on an in-corpus query, and a Layer 2 refusal on an
+out-of-domain query.
+
+| In-corpus: "BRAF V600E mutation in melanoma" | Out-of-scope: "how to bake sourdough bread" |
+|---|---|
+| ![Cited answer for BRAF V600E query](docs/braf_cited_answer.png) | ![Out-of-scope refusal for bread query](docs/bread_refusal.png) |
+
+The BRAF response cites the retrieved trials by NCT ID directly in the answer
+text. The bread query triggers the system-prompt rule for non-medical
+questions and returns a scope-aware refusal without invoking the LLM
+generation step on the retrieved chunks.
+
+---
+
 ## Key design decisions
 
 ### PubMedBERT over MiniLM and OpenAI embeddings
