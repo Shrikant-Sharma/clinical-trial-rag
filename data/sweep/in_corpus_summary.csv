@@ -1,0 +1,4 @@
+size,n_total,n_answered,n_refused,refusal_rate,faith_when_answered,ctx_precision_all,mean_claims_when_answered
+500,6,3,3,0.5,0.694,0.467,6.7
+1000,6,2,4,0.667,0.774,0.4,6.5
+1500,6,2,4,0.667,1.0,0.333,7.5

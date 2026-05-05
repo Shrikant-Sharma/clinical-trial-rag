@@ -1,0 +1,7 @@
+query,size_500_refused,size_1000_refused,size_1500_refused
+Are there trials studying antibody drug conjugates for HER2 positive cancer?,False,True,True
+What are reported hazard ratios for overall survival in phase 3 oncology trials?,True,True,True
+What are the eligibility criteria for trials enrolling patients age 65 and older?,True,True,True
+What trials use CAR-T cell therapy for leukemia or lymphoma?,True,True,True
+What trials use pembrolizumab in non-small cell lung cancer?,False,False,False
+Which trials target the BRAF V600E mutation?,False,False,False
