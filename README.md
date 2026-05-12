@@ -426,7 +426,7 @@ splitters, Streamlit, pandas.
 ## Run it locally
 
 ```bash
-git clone https://github.com/[github-handle]/clinical-trial-rag
+git clone https://github.com/Shrikant-Sharma/clinical-trial-rag
 cd clinical-trial-rag
 pip install -r requirements.txt
 echo "GROQ_API_KEY=your_key_here" > .env
