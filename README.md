@@ -64,7 +64,7 @@ roughly 1.5 seconds end-to-end (PubMedBERT loaded once at app startup via
 
 ## Example outputs
 
-Two representative interactions from the deployed Streamlit interface — a
+Two representative interactions from the deployed Streamlit interface: a
 successful cited answer on an in-corpus query, and a Layer 2 refusal on an
 out-of-domain query.
 
