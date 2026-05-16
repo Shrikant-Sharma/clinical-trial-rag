@@ -13,7 +13,7 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ---- Config ----
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -103,6 +103,31 @@ def build_context(results):
     return "\n\n---\n\n".join(blocks)
 
 
+def generate_answer(query, results, client):
+    """
+    Call Groq with retrieved context and the system prompt. Returns just
+    the answer text. Does NOT include retrieval, threshold checking, or
+    refusal logic — those are the caller's responsibility.
+
+    Shared between rag.generate() (baseline single-shot RAG) and
+    agent._generate_node (agentic path). Centralizing the LLM call here
+    means a future tweak to temperature, max_tokens, or the system prompt
+    flows to both paths automatically.
+    """
+    context = build_context(results)
+    user_message = f"Context:\n\n{context}\n\n---\n\nQuestion: {query}"
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.1,
+        max_tokens=400,
+    )
+    return response.choices[0].message.content
+
+
 def generate(query, client, model, index, chunks, k=DEFAULT_K, threshold=DEFAULT_THRESHOLD):
     """
     Full RAG pipeline: retrieve -> threshold check (Layer 1) ->
@@ -123,21 +148,9 @@ def generate(query, client, model, index, chunks, k=DEFAULT_K, threshold=DEFAULT
         }
 
     # Layer 2: LLM with refusal clause in system prompt
-    context = build_context(results)
-    user_message = f"Context:\n\n{context}\n\n---\n\nQuestion: {query}"
-
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=0.1,
-        max_tokens=400,
-    )
-
+    answer = generate_answer(query, results, client)
     return {
-        "answer": response.choices[0].message.content,
+        "answer": answer,
         "sources": results,
         "top_score": top_score,
         "refused_at": None,

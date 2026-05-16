@@ -1,9 +1,15 @@
 # Clinical Trial Intelligence System
 
 A retrieval-augmented question-answering system over 484 ClinicalTrials.gov
-studies. Built end-to-end: data ingestion, recursive chunking, biomedical
-embeddings, FAISS retrieval, LLM generation with citations, two-layer safety,
-and RAGAS-equivalent evaluation across three chunk sizes.
+studies. Built end-to-end and offered in two reasoning modes: a baseline
+single-shot RAG pipeline, and a LangGraph-orchestrated agentic mode
+implementing the Corrective RAG (CRAG) pattern with document relevance
+grading, query rewriting on poor retrieval, and bounded retries.
+
+The pipeline covers data ingestion, recursive chunking, biomedical
+embeddings, FAISS retrieval, LLM generation with citations, multi-layer
+safety (two layers in baseline, three in agentic mode), and RAGAS-equivalent
+evaluation across three chunk sizes.
 
 **Live demo:** [shrikant-clinical-rag.streamlit.app](https://shrikant-clinical-rag.streamlit.app/)
 **Author:** Shrikant Sharma | [LinkedIn](https://www.linkedin.com/in/shrikant-sharma/)
@@ -211,6 +217,115 @@ legitimate medical queries also score in the 0.85+ band.
 
 ---
 
+## Phase 2: Agentic upgrade (Corrective RAG with LangGraph)
+
+The 25-query stress test and the chunking sweep both surfaced the same
+finding: **Layer 1 (the cosine similarity threshold) never fires in
+practice**. Adversarial out-of-domain queries score 0.86 to 0.91. The
+threshold sits at 0.50. PubMedBERT — like most dense bi-encoders — has a
+high similarity floor; even gibberish (`asdf qwer zxcv lkjh`) scored 0.914
+against the clinical corpus.
+
+The threshold gate was designed for catastrophic OOD only. For borderline
+cases where retrieved chunks are topically adjacent but don't actually
+answer the question, the threshold offers no defense. The LLM refusal
+clause (Layer 2) helped, but it was a single point of failure: a flaky
+LLM, a prompt regression, or a model deprecation would silently degrade
+safety.
+
+Phase 2 adds a third independent defense: an LLM-as-judge that grades
+retrieved documents for relevance to the query before generation, and
+retries with a reformulated query if the grade is poor. The architecture
+is the **Corrective RAG (CRAG)** pattern from recent agentic-RAG
+literature, implemented via LangGraph for the orchestration.
+
+### Why LangGraph (and only for orchestration)
+
+The baseline retrieval and generation path in `rag.py` intentionally
+avoids LangChain — embeddings, FAISS, and the Groq client are all called
+directly. LangGraph (a library from the LangChain team) is used in
+`agent.py` purely for state-machine orchestration: defining nodes,
+conditional edges, and the retry loop. Core retrieval and generation are
+unchanged. The reasoning:
+
+- **Orchestration is the part LangGraph does well.** State management,
+  conditional routing, retry loops with cycle detection — implementing
+  these manually is hundreds of lines of boilerplate with subtle bugs.
+- **Retrieval is the part where abstraction creates more problems than
+  it solves.** LangChain's retrievers add wrappers that hide important
+  details (which embedding model, which distance metric, how dedup
+  works). Keeping retrieval as direct FAISS + sentence-transformers
+  calls means every retrieval decision is visible in source.
+
+The two halves communicate through a typed state schema (`AgentState`,
+a `TypedDict`) and shared helpers (`build_context`, `generate_answer`)
+that either path can call. The shared helpers also keep the baseline
+and agentic paths consistent: a future temperature or prompt tweak in
+`generate_answer` flows to both automatically.
+
+### The state machine
+
+```mermaid
+flowchart LR
+    Q[Query] --> RT[retrieve<br/>FAISS top-k]
+    RT --> L1{cosine ≥ 0.50?}
+    L1 -->|no| REF[refuse]
+    L1 -->|yes| GR[grade documents<br/>LLM relevance check]
+    GR --> RL{relevant?}
+    RL -->|yes| GEN[generate<br/>+ refusal detection]
+    RL -->|no| RC{retries &lt; MAX?}
+    RC -->|yes| RW[rewrite query] --> RT
+    RC -->|no| REF
+    GEN --> OUT[cited answer<br/>or refused_at=generation]
+```
+
+Five nodes: `retrieve`, `grade`, `rewrite_query`, `generate`, `refuse`.
+Two conditional edges: after `retrieve` (threshold check), after `grade`
+(three-way fork on relevance and retry count). The rewrite path loops
+back to `retrieve` exactly once before refusing — `MAX_RETRIES = 1` is a
+deliberate hyperparameter. Empirically, one rewrite recovers most
+vague-question failures; beyond one, the question is usually genuinely
+out of scope and refusing is correct.
+
+### Three refusal gates, each catching what the others miss
+
+The agent has three independent refusal paths, each with a distinct
+`refused_at` attribution for telemetry:
+
+| Gate | When it fires | What it catches |
+|---|---|---|
+| `threshold` | top cosine < 0.50 after retrieve | Catastrophic OOD (gibberish, malformed input). Rarely fires in practice. |
+| `max_retries_exhausted` | grader returns `not_relevant` after retry | Topically-adjacent but actually irrelevant retrieval — the gap embeddings can't see. |
+| `generation` | LLM emits the canonical refusal phrase from `SYSTEM_PROMPT` | On-topic retrieval that doesn't actually contain the answer to the specific question (e.g., asking about side effects against a protocol-only corpus). |
+
+The empirical validation that all three gates do distinct work came from
+testing the agent on a single gibberish query (`asdf qwer zxcv lkjh`),
+which scored 0.914 cosine similarity. The threshold gate completely
+missed it (0.914 ≫ 0.50). The LLM grader correctly judged the retrieved
+chunks as `not_relevant`. The rewriter took one shot at recovery,
+retrieval still missed, the grader stuck to its judgment, and
+`max_retries_exhausted` terminated cleanly. Each gate did something
+neither of the others could have done. That's defense in depth, made
+literal.
+
+### Two-mode UI for A/B comparison
+
+The Streamlit app exposes both modes as a sidebar toggle:
+
+- **Agentic (CRAG)** — the new flow. Default.
+- **Baseline (single-shot)** — original `retrieve → threshold → generate`,
+  preserved verbatim.
+
+Both share the same retrieval, embedding model, FAISS index, and base LLM
+prompt. The only difference is the orchestration layer. Toggling between
+them on the same query is the clearest way to see what grading and retry
+add: a vague clinical query like "tell me about pembrolizumab" gets
+rewritten in agentic mode (to something like "pembrolizumab clinical
+trials phase 3 non small cell lung cancer treatment") and produces a
+sharper retrieval, while baseline takes the original query as-is.
+
+---
+
 ## Evaluation
 
 Three independent evaluation passes were run during development.
@@ -350,17 +465,27 @@ Specific known limitations:
   in the chunking sweep. Results are directionally meaningful but not
   statistically robust. A 50-100 query gold set with held-out reference
   answers is the natural next step.
-- **No reranking, conversational memory, or agentic capabilities.** All
-  three are on the roadmap below.
+- **No reranking or conversational memory.** Both are on the roadmap
+  below. Agentic orchestration (CRAG with document grading and retry)
+  was added in Phase 2 — see "Phase 2: Agentic upgrade" above.
 
 ---
 
 ## Roadmap
 
-**Phase 2: agentic upgrade with LangGraph.** Query routing (specific NCT
-lookup vs semantic search vs follow-up clarification), tool calling for
-ClinicalTrials.gov API pulls on cache miss, conversational memory across
-turns. Highest-priority next step.
+**Phase 2: agentic upgrade — DONE.** Corrective RAG (CRAG) pattern via
+LangGraph, with document relevance grading, query rewriting on poor
+retrieval, and bounded retries. Two-mode UI lets users compare against
+the baseline pipeline. See "Phase 2: Agentic upgrade" above for the
+architecture and validation. Items deferred to a future iteration:
+
+- **Conversational memory.** Multi-turn dialog where the agent
+  remembers context from earlier queries in the same session.
+- **Tool calling for live ClinicalTrials.gov API lookups** on cache
+  miss (e.g., user asks about a specific NCT ID not in the indexed
+  corpus).
+- **Specific-NCT routing** so the agent recognizes `NCT0xxxxxxx`
+  patterns and skips semantic retrieval in favor of direct lookup.
 
 **Reranker.** Cross-encoder (e.g., `cross-encoder/ms-marco-MiniLM-L-6-v2`)
 applied to the top-20 candidates before the dedup step. Should improve
@@ -414,12 +539,34 @@ misleading "retrieval is bad" conclusion. The chunks were on-topic. The
 judge was strict. Reading the actual judgements before reporting the
 aggregate is the difference between a defensible metric and a misleading one.
 
+**Defense in depth means each layer can be lenient.** The threshold gate
+at 0.50 doesn't catch most OOD — natural-language gibberish scores 0.91.
+That used to feel like a problem with the threshold. After adding the
+LLM relevance grader as a second independent defense, the lenience of
+any single gate stopped mattering: as long as one of the three
+(threshold, grader, max-retries) catches each OOD case, the system is
+safe. Each gate can specialize — threshold for speed, grader for
+semantic precision, retry-cap for guarantees. This is why defense in
+depth beats a single perfect filter in practice, and it's the
+architectural argument for the agentic upgrade as much as anything in
+the CRAG paper.
+
+**LangGraph state mutation has a learning curve worth flagging.**
+TypedDict for state is idiomatic and lightweight, but each node must
+return a *partial* state dict that LangGraph merges into the full state
+— not the full state directly, or you'd lose other nodes' updates.
+Conditional edge functions are pure routing (they return a string), not
+state mutators. Getting these conventions right took two debugging
+cycles; once the pattern was clear, every subsequent node was 10 lines
+and didn't need re-explanation.
+
 ---
 
 ## Tech stack
 
-Python 3.13, sentence-transformers, FAISS, Groq API, LangChain text
-splitters, Streamlit, pandas.
+Python 3.13, sentence-transformers, FAISS, Groq API, LangGraph (agentic
+orchestration), LangChain text splitters (recursive chunking only),
+Streamlit, pandas.
 
 ---
 
