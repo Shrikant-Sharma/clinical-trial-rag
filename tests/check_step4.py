@@ -30,7 +30,7 @@ def main():
     # ---- Test 0: rag.generate() unchanged after refactor ----
     print("Test 0: rag.generate() regression check")
     result = generate(
-        "What are the side effects of pembrolizumab?",
+        "What conditions are pembrolizumab clinical trials targeting?",
         client, model, index, chunks,
     )
     print(f"  answer (first 80 chars): {result['answer'][:80]}...")
@@ -43,7 +43,8 @@ def main():
 
     # ---- Test 1: _generate_node produces an answer ----
     print("Test 1: _generate_node end-to-end")
-    state = {"current_query": "What are the side effects of pembrolizumab?"}
+    state = {
+        "current_query": "What conditions are pembrolizumab clinical trials targeting?"}
     state.update(_retrieve_node(state, model, index, chunks))
     result = _generate_node(state, client)
     print(f"  answer (first 80 chars): {result['answer'][:80]}...")

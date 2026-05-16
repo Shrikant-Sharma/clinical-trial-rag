@@ -158,15 +158,24 @@ def _generate_node(state: AgentState, client) -> dict:
     Generate the final answer from retrieved documents.
 
     Wraps rag.generate_answer() so the agentic and baseline paths share
-    the same LLM call. Returns answer + sources; refused_at stays None
-    because this node is reached only on the success path.
+    the same LLM call. Also detects the canonical refusal phrase from
+    rag.SYSTEM_PROMPT: if the LLM declined to answer despite retrieval
+    and grading succeeding, surface that as refused_at = "generation".
+    This catches the failure mode where retrieved docs are on-topic but
+    don't actually contain the answer to the specific question (common
+    in a protocol-only corpus when users ask about results or side
+    effects).
     """
     answer = generate_answer(
         state["current_query"], state["documents"], client)
+
+    canonical_refusal = "I don't have enough information in the retrieved trials"
+    is_refusal = canonical_refusal in answer
+
     return {
         "answer": answer,
-        "sources": state["documents"],
-        "refused_at": None,
+        "sources": [] if is_refusal else state["documents"],
+        "refused_at": "generation" if is_refusal else None,
     }
 
 
@@ -202,3 +211,47 @@ def _grade_documents(state: AgentState, client) -> dict:
         relevance = "relevant"
 
     return {"relevance": relevance}
+
+
+def _rewrite_query(state: AgentState, client) -> dict:
+    """
+    Reformulate the current query to improve retrieval after a poor grade.
+
+    Uses REWRITER_PROMPT to ask the LLM for a sharper, more clinical
+    version of the query: drop conversational filler, add domain
+    vocabulary, preserve medical intent. Increments retry_count so
+    _route_after_grade can stop after MAX_RETRIES rewrites.
+    """
+    prompt = REWRITER_PROMPT.format(
+        original_query=state["original_query"],
+        current_query=state["current_query"],
+    )
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=100,
+    )
+    new_query = response.choices[0].message.content.strip()
+
+    return {
+        "current_query": new_query,
+        "retry_count": state["retry_count"] + 1,
+    }
+
+
+def _route_after_grade(state: AgentState) -> str:
+    """
+    Three-way routing after document grading.
+
+    Returns one of:
+        "generate" — relevant docs found; produce the answer.
+        "rewrite"  — docs not relevant, retries remain; reformulate and retry.
+        "refuse"   — docs not relevant and retries exhausted; refuse honestly
+                     rather than hallucinating.
+    """
+    if state["relevance"] == "relevant":
+        return "generate"
+    if state["retry_count"] < MAX_RETRIES:
+        return "rewrite"
+    return "refuse"
