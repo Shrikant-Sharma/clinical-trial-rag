@@ -606,4 +606,4 @@ free-tier budget if run in a single session.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT.See [LICENSE](LICENSE).
