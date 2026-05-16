@@ -24,7 +24,7 @@ Public API:
 
 from typing import TypedDict, Optional
 
-from rag import retrieve, DEFAULT_THRESHOLD
+from rag import retrieve, DEFAULT_THRESHOLD, build_context, generate_answer, LLM_MODEL
 
 
 # ---- Config ----
@@ -151,3 +151,54 @@ def _route_after_retrieve(state: AgentState) -> str:
     if state["top_score"] < DEFAULT_THRESHOLD:
         return "refuse"
     return "grade"
+
+
+def _generate_node(state: AgentState, client) -> dict:
+    """
+    Generate the final answer from retrieved documents.
+
+    Wraps rag.generate_answer() so the agentic and baseline paths share
+    the same LLM call. Returns answer + sources; refused_at stays None
+    because this node is reached only on the success path.
+    """
+    answer = generate_answer(
+        state["current_query"], state["documents"], client)
+    return {
+        "answer": answer,
+        "sources": state["documents"],
+        "refused_at": None,
+    }
+
+
+def _grade_documents(state: AgentState, client) -> dict:
+    """
+    Grade retrieved documents for relevance to the current query.
+
+    Calls the LLM with GRADER_PROMPT and parses the one-word response.
+    Sets state["relevance"] to "relevant" or "not_relevant". On unexpected
+    LLM output, defaults to "relevant" (fail-open) so a flaky grader does
+    not spuriously refuse a valid query — the threshold gate and the LLM
+    refusal clause in generate_answer() are independent backstops.
+    """
+    context = build_context(state["documents"])
+    prompt = GRADER_PROMPT.format(
+        query=state["current_query"], context=context)
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,   # Deterministic for grading.
+        max_tokens=10,     # One word answer.
+    )
+    output = response.choices[0].message.content.strip().lower()
+
+    # Normalize: check "not_relevant" before "relevant" since both contain
+    # the substring "relevant".
+    if "not_relevant" in output or "not relevant" in output:
+        relevance = "not_relevant"
+    elif "relevant" in output:
+        relevance = "relevant"
+    else:
+        # Defensive default: fail-open on unexpected LLM output.
+        relevance = "relevant"
+
+    return {"relevance": relevance}
