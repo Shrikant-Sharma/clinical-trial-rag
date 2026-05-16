@@ -22,7 +22,10 @@ Public API:
     run_agent(query, ...) Convenience wrapper around build_agent + invoke.
 """
 
+from functools import partial
 from typing import TypedDict, Optional
+
+from langgraph.graph import StateGraph, END
 
 from rag import retrieve, DEFAULT_THRESHOLD, build_context, generate_answer, LLM_MODEL
 
@@ -255,3 +258,95 @@ def _route_after_grade(state: AgentState) -> str:
     if state["retry_count"] < MAX_RETRIES:
         return "rewrite"
     return "refuse"
+
+
+# ---- Graph assembly ----
+def build_agent(client, model, index, chunks):
+    """
+    Build and compile the self-corrective RAG agent.
+
+    Graph topology:
+        START -> retrieve -> route_after_retrieve
+                              "grade"  -> grade -> route_after_grade
+                                                    "generate" -> generate -> END
+                                                    "rewrite"  -> rewrite -> retrieve (loop)
+                                                    "refuse"   -> refuse  -> END
+                              "refuse" -> refuse -> END
+
+    Dependencies (model, index, chunks, client) are bound to each node
+    via functools.partial so LangGraph sees the canonical 1-arg state
+    callable. Build once at app startup, invoke per query.
+
+    Returns:
+        A compiled CompiledStateGraph. Pass to run_agent() or call
+        .invoke(initial_state) directly.
+    """
+    graph = StateGraph(AgentState)
+
+    # Bind dependencies to each node.
+    retrieve_node = partial(_retrieve_node, model=model,
+                            index=index, chunks=chunks)
+    grade_node = partial(_grade_documents, client=client)
+    rewrite_node = partial(_rewrite_query, client=client)
+    generate_node = partial(_generate_node, client=client)
+
+    # Register nodes.
+    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("grade", grade_node)
+    graph.add_node("rewrite", rewrite_node)
+    graph.add_node("generate", generate_node)
+    graph.add_node("refuse", _refuse_node)
+
+    # Entry point.
+    graph.set_entry_point("retrieve")
+
+    # After retrieve: threshold gate.
+    graph.add_conditional_edges(
+        "retrieve",
+        _route_after_retrieve,
+        {"grade": "grade", "refuse": "refuse"},
+    )
+
+    # After grade: three-way fork.
+    graph.add_conditional_edges(
+        "grade",
+        _route_after_grade,
+        {"generate": "generate", "rewrite": "rewrite", "refuse": "refuse"},
+    )
+
+    # Rewrite loops back to retrieve. Terminal edges to END.
+    graph.add_edge("rewrite", "retrieve")
+    graph.add_edge("generate", END)
+    graph.add_edge("refuse", END)
+
+    return graph.compile()
+
+
+def run_agent(query, graph):
+    """
+    Convenience wrapper: invoke the agent on a query and return the final state.
+
+    Constructs the initial state from the query (original and current set
+    equal, retry_count = 0, other fields at neutral defaults) and invokes
+    the compiled graph.
+
+    Args:
+        query: The user's question as a plain string.
+        graph: A compiled agent graph from build_agent().
+
+    Returns:
+        Final state dict — contains answer, sources, refused_at, top_score,
+        retry_count, etc. See AgentState for the full schema.
+    """
+    initial_state = {
+        "original_query": query,
+        "current_query": query,
+        "documents": [],
+        "top_score": 0.0,
+        "relevance": None,
+        "retry_count": 0,
+        "answer": "",
+        "sources": [],
+        "refused_at": None,
+    }
+    return graph.invoke(initial_state)
