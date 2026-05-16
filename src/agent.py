@@ -27,7 +27,7 @@ from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
 
-from rag import retrieve, DEFAULT_THRESHOLD, build_context, generate_answer, LLM_MODEL
+from src.rag import retrieve, DEFAULT_THRESHOLD, build_context, generate_answer, LLM_MODEL
 
 
 # ---- Config ----

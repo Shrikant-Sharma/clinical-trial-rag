@@ -15,8 +15,8 @@ Run from the repo root with PYTHONPATH set:
     PowerShell: $env:PYTHONPATH = "src"; python tests/check_step4.py
     Bash:       PYTHONPATH=src python tests/check_step4.py
 """
-from rag import load_model, load_index, load_chunks, make_groq_client, generate
-from agent import _retrieve_node, _generate_node, _grade_documents
+from src.rag import load_model, load_index, load_chunks, make_groq_client, generate
+from src.agent import _retrieve_node, _generate_node, _grade_documents
 
 
 def main():

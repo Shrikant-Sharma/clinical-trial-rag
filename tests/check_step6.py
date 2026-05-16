@@ -15,8 +15,8 @@ Verifies:
 Run from the repo root with PYTHONPATH set:
     PowerShell: $env:PYTHONPATH = "src"; python tests/check_step6.py
 """
-from rag import load_model, load_index, load_chunks, make_groq_client
-from agent import build_agent, run_agent, MAX_RETRIES
+from src.rag import load_model, load_index, load_chunks, make_groq_client
+from src.agent import build_agent, run_agent, MAX_RETRIES
 
 
 def main():
