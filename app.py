@@ -6,6 +6,8 @@ Two reasoning modes:
   query rewriting on poor retrieval, and bounded retries.
 - Baseline (single-shot): original retrieve -> threshold -> generate flow.
 
+Optional cross-encoder reranker applied to both modes for second-stage rescoring.
+
 Run with: streamlit run app.py
 """
 
@@ -15,6 +17,7 @@ from src.rag import (
     load_chunks,
     load_index,
     load_model,
+    load_reranker,
     make_groq_client,
     generate,
     DEFAULT_THRESHOLD,
@@ -52,23 +55,24 @@ def _load_groq_client():
     return make_groq_client()
 
 
-@st.cache_resource(show_spinner="Compiling LangGraph agent...")
-def _load_agent():
-    """Build the agent once at app startup. Reuses the cached deps."""
-    return build_agent(
-        client=_load_groq_client(),
-        model=_load_model(),
-        index=_load_index(),
-        chunks=_load_chunks(),
-    )
+@st.cache_resource(show_spinner="Loading cross-encoder reranker (~90MB, first run only)...")
+def _load_reranker():
+    """Load the cross-encoder reranker once per Streamlit session."""
+    return load_reranker()
 
 
-# Load everything at startup.
+@st.cache_resource
+def _load_agent(use_reranker: bool):
+    """Build the LangGraph agent. Streamlit caches one graph per reranker setting."""
+    rr = _load_reranker() if use_reranker else None
+    return build_agent(client, model, index, chunks, reranker=rr)
+
+
+# Load core resources at startup.
 model = _load_model()
 index = _load_index()
 chunks = _load_chunks()
 client = _load_groq_client()
-agent_graph = _load_agent()
 
 
 # ---- UI ----
@@ -94,6 +98,20 @@ with st.sidebar:
         ),
     )
     is_agentic = mode == "Agentic (CRAG)"
+
+    st.divider()
+    st.header("Retrieval")
+    use_reranker = st.checkbox(
+        "Cross-encoder reranker",
+        value=True,
+        help=(
+            "Adds second-stage rescoring with cross-encoder/ms-marco-MiniLM-L-6-v2 "
+            "to the top-20 FAISS candidates before dedup. Fixes cases where dense "
+            "embeddings rank topically-similar chunks above actually-relevant ones "
+            "(e.g., generic trastuzumab studies ranked above trastuzumab-deruxtecan "
+            "for HER2+ breast cancer)."
+        ),
+    )
 
     st.divider()
     st.header("Baseline settings")
@@ -125,6 +143,10 @@ with st.sidebar:
             st.session_state["query"] = ex
 
 
+# Build agent graph AFTER use_reranker is defined in the sidebar.
+agent_graph = _load_agent(use_reranker)
+
+
 # ---- Main search ----
 query = st.text_input(
     "Ask a question about clinical trials:",
@@ -142,8 +164,10 @@ if query:
         if is_agentic:
             result = run_agent(query, agent_graph)
         else:
+            reranker = _load_reranker() if use_reranker else None
             result = generate(
-                query, client, model, index, chunks, k=k, threshold=threshold,
+                query, client, model, index, chunks,
+                k=k, threshold=threshold, reranker=reranker,
             )
 
     # ---- Status row: similarity + outcome ----
@@ -204,8 +228,10 @@ if query:
     if result["sources"]:
         st.subheader("Sources retrieved")
         for src in result["sources"]:
+            rerank_score = src.get("rerank_score")
+            rerank_str = f"  ·  rerank: {rerank_score:+.2f}" if rerank_score is not None else ""
             with st.expander(
-                f"#{src['rank']}  {src['nct_id']}  (similarity: {src['score']:.3f})  —  {src['title'][:80]}"
+                f"#{src['rank']}  {src['nct_id']}  (similarity: {src['score']:.3f}{rerank_str})  —  {src['title'][:80]}"
             ):
                 st.markdown(
                     f"**[View on ClinicalTrials.gov](https://clinicaltrials.gov/study/{src['nct_id']})**"

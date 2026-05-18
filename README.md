@@ -8,8 +8,9 @@ grading, query rewriting on poor retrieval, and bounded retries.
 
 The pipeline covers data ingestion, recursive chunking, biomedical
 embeddings, FAISS retrieval, LLM generation with citations, multi-layer
-safety (two layers in baseline, three in agentic mode), and RAGAS-equivalent
-evaluation across three chunk sizes.
+safety (two layers in baseline, three in agentic mode), an optional
+cross-encoder reranker applied to both modes for two-stage retrieval, and
+RAGAS-equivalent evaluation across three chunk sizes.
 
 **Live demo:** [shrikant-clinical-rag.streamlit.app](https://shrikant-clinical-rag.streamlit.app/)
 **Author:** Shrikant Sharma | [LinkedIn](https://www.linkedin.com/in/shrikant-sharma/)
@@ -161,8 +162,9 @@ top-5 retrieval might return 5 chunks but only 3 unique trials, crowding out
 relevant trials at lower ranks.
 
 ```python
-def retrieve(query, model, index, chunks, k=5, fetch_multiplier=4):
+def retrieve(query, model, index, chunks, k=5, fetch_multiplier=4, reranker=None):
     # Fetch 4*k = 20 candidates from FAISS
+    # (Optional) cross-encoder rescores all 20 — see Phase 3
     # Walk in score order, keep best-scoring chunk per nct_id
     # Return top-5 unique trials
 ```
@@ -326,6 +328,143 @@ sharper retrieval, while baseline takes the original query as-is.
 
 ---
 
+## Phase 3: Cross-encoder reranker
+
+The chunking-sweep evaluation in the previous build flagged a real
+retrieval limitation: context precision averaged 0.40 across all three
+chunk sizes, and the trastuzumab-deruxtecan (T-DXd) chunk for the
+HER2-positive antibody-drug-conjugate query was ranked lower than the
+generic trastuzumab-and-chemotherapy studies. The original Limitations
+section called out this exact pattern: *"Different chunking configurations
+surface T-DXd chunks at different ranks for the same query. Retrieval is
+not robust to specialized terminology that appears once or twice in the
+corpus."*
+
+The root cause is structural to the bi-encoder retrieval approach. A
+dense bi-encoder embedding (PubMedBERT here) compresses query and document
+into separate vectors that get compared by cosine similarity. That's fast
+and scales — but the encoder never sees the two together, it only scores
+similarity to a global semantic geometry. For specialized clinical
+vocabulary that doesn't dominate the corpus (T-DXd appears in only a
+handful of protocols), the bi-encoder will rank a more common-vocabulary
+chunk above the actually-relevant one, and no threshold or chunking tweak
+fixes that.
+
+A cross-encoder reads query and document jointly. It's slower per pair
+(no precomputation possible) but dramatically more accurate on relevance
+because it sees both at once. The standard production pattern is
+two-stage retrieval: cheap dense retrieval for recall, expensive
+cross-encoder reranking for precision.
+
+### Architecture: rerank before dedup
+
+```mermaid
+flowchart LR
+    Q[Query] --> F[FAISS top-20]
+    F --> RR{reranker on?}
+    RR -->|yes| CE[cross-encoder<br/>rescore all 20]
+    RR -->|no| DD
+    CE --> DD[Dedup by NCT ID<br/>walk current sort order]
+    DD --> TOP[Top-5 unique trials]
+```
+
+A reranker node sits between FAISS retrieval and the dedup step. The
+20 candidates from FAISS are rescored by the cross-encoder, then dedup
+walks the reranked list. Reranking **before** dedup is the key
+architectural choice: it ensures the best chunk per trial (per the
+cross-encoder) survives, not just the best FAISS-ranked chunk.
+
+```python
+def retrieve(query, model, index, chunks, k=5, fetch_multiplier=4, reranker=None):
+    """When reranker is None, behaves identically to the original single-stage
+    retrieval. When a cross-encoder is provided, all fetched candidates are
+    rescored BEFORE dedup so the cross-encoder chooses which chunk per trial
+    survives, not just which order trials appear in. The cosine `score` field
+    is preserved on every result so the agent's 0.50 threshold gate stays
+    calibrated."""
+```
+
+The reranker is `cross-encoder/ms-marco-MiniLM-L-6-v2` — 22M parameters,
+about 90MB, fast on CPU (~50ms for 20 query-document pairs). Trained on
+the MS-MARCO passage ranking dataset, it generalizes well to clinical
+text despite not being domain-specific. A biomedical-tuned cross-encoder
+(e.g., a PubMedBERT-MS-MARCO variant) would likely score higher, but the
+generic MS-MARCO model already produces a clear improvement on the
+documented failure modes, and the 90MB footprint is convenient for
+Streamlit Cloud deployment.
+
+### Empirical validation: the HER2 ADC query before and after
+
+The headline test is the exact query that the Limitations section called
+out as a known failure mode — *"Are there trials studying antibody drug
+conjugates for HER2-positive cancer?"* — before and after adding the
+reranker.
+
+**Without reranker** (bi-encoder cosine ranking):
+
+| Rank | NCT | Cosine | Title |
+|---|---|---|---|
+| 1 | NCT00004888 | 0.941 | Combination Chemotherapy With or Without Trastuzumab |
+| 2 | NCT00499122 | 0.933 | NOV-002, Doxorubicin, Cyclophosphamide, and Docetaxel |
+| 3 | NCT04836156 | 0.932 | Neoadjuvant Therapy Study Guided by Drug Screening |
+| 4 | NCT02307227 | 0.931 | Phase II Study With Trastuzumab + Paclitaxel |
+| 5 | NCT06367088 | 0.929 | Cadonilimab Combined With Chemotherapy |
+
+Top-1 cosine is 0.941. The retrieved chunks are all topically related
+(HER2, breast cancer, trastuzumab) but none of them are about
+antibody-drug conjugates specifically. The Agentic CRAG mode correctly
+**refused** this set: the LLM grader judged the chunks topically related,
+but the generator could not produce an ADC-grounded answer, so the
+canonical refusal phrase fired and `refused_at="generation"` was
+attributed. Layer 3 saved the user from a confabulated answer — exactly
+as designed.
+
+**With reranker** (cross-encoder rescoring):
+
+| Rank | NCT | Cosine | Rerank | Title |
+|---|---|---|---|---|
+| 1 | NCT05710666 | 0.926 | **+5.02** | Neoadjuvant **Trastuzumab Deruxtecan (T-DXd)** |
+| 2 | NCT04836156 | 0.932 | +4.67 | Neoadjuvant Therapy Study Guided by Drug Screening |
+| 3 | NCT06727227 | 0.926 | +3.84 | Real-world Study of **Trastuzumab Deruxtecan** |
+| 4 | NCT07553741 | 0.924 | +3.75 | Imaging Comparison [68Ga]Ga-FAPI-04 PET, [18F]FDG |
+| 5 | NCT02307227 | 0.927 | +3.38 | Phase II Study With Trastuzumab + Paclitaxel |
+
+Two T-DXd trials now appear in the top 5. The Agentic CRAG mode produces
+a cited answer instead of refusing:
+
+> *"Trastuzumab deruxtecan (T-DXd) is an antibody-drug conjugate (ADC)
+> being studied for HER2-positive breast cancer [NCT05710666]. It has
+> shown benefits for HER2-low status BC, leading to its EMA approval for
+> HER2-low BC in January 2023 [NCT06727227]. In the SHAMROCK study,
+> patients with early stage HER2-positive breast cancer receive
+> neoadjuvant treatment of T-DXd [NCT05710666]."*
+
+The cosine scores in the reranked top-5 are *lower* than in the
+non-reranked top-5 (0.926 vs 0.941). That gap is the point of two-stage
+retrieval: a 0.926 T-DXd chunk is more relevant than a 0.941 generic
+trastuzumab chunk, and only the cross-encoder can tell the difference.
+
+### Two-mode UI extension
+
+The Streamlit app exposes the reranker as an additional sidebar toggle
+that applies to both reasoning modes. A user can run the same query
+across all four configurations (Agentic / Baseline × Reranker on / off)
+and see exactly which retrieval differences the cross-encoder is buying.
+When the reranker is on, retrieved-source expanders display the
+`rerank_score` alongside the cosine similarity.
+
+### Quantitative evaluation (pending)
+
+A controlled comparison (chunk size = 1000, 6 in-corpus queries × 2
+configs, LLM-as-judge for faithfulness and context precision) is
+implemented in `notebooks/03_chunking_sweep.ipynb` under "Step D —
+Reranker comparison". The expected headline metrics: **context precision
+lift** from the Phase 1 baseline (0.40 across all chunk sizes) and
+**refusal-rate change** on the 6 in-corpus queries. Results table will
+be inserted here after the next evaluation run.
+
+---
+
 ## Evaluation
 
 Three independent evaluation passes were run during development.
@@ -349,7 +488,9 @@ a real corpus-vocabulary limitation: the system retrieved the correct trials
 for "antibody-drug conjugates in HER2-positive cancer" but ranked the
 trastuzumab-deruxtecan chunk lower than expected. The corpus contained the
 chunk; retrieval recovered it; the LLM's answer correctly hedged the
-HER2-low vs HER2-positive distinction. Documented in Limitations below.
+HER2-low vs HER2-positive distinction. **This finding directly motivated
+Phase 3 — see "Cross-encoder reranker" above for the architectural fix
+and validation.**
 
 ### 2. Chunking sweep: 3 chunk sizes, RAGAS-equivalent metrics
 
@@ -424,7 +565,8 @@ all five retrieved chunks were topically relevant; the LLM judge applied a
 strict "directly answers the question" criterion that penalized chunks where
 query terms appeared in inclusion/exclusion criteria rather than trial
 design. Treating the 0.40 as evidence of poor retrieval would be misleading.
-A dedicated cross-encoder reranker is the natural Phase 2 improvement.
+A dedicated cross-encoder reranker is the natural improvement — implemented
+in Phase 3 above.
 
 ### 3. Verdict
 
@@ -448,26 +590,33 @@ Specific known limitations:
   boilerplate rather than the chunks containing the specific numerical
   value. The embedding matches structural patterns ("Eligibility:
   Inclusion Criteria") more strongly than numerical content.
-- **Vocabulary fragility on emerging therapies.** Different chunking
-  configurations surface trastuzumab-deruxtecan (T-DXd) chunks at different
-  ranks for the same query. Retrieval is not robust to specialized
-  terminology that appears once or twice in the corpus.
+- **Vocabulary fragility on emerging therapies — mitigated by Phase 3.**
+  Without the reranker, different chunking configurations surface
+  trastuzumab-deruxtecan (T-DXd) chunks at different ranks for the same
+  query. The cross-encoder reranker added in Phase 3 fixes this for the
+  HER2 ADC case; the broader pattern (dense bi-encoders struggle with
+  vocabulary that appears in only a handful of documents) is structural
+  and applies to any rare clinical term.
 - **The cosine threshold (Layer 1) does not fire in evaluation.**
   Adversarial queries score 0.86 to 0.91, well above the 0.50 threshold.
-  The LLM refusal clause (Layer 2) carries the operational safety load.
-  Layer 1 remains as a backstop, but raising it would also reduce recall
-  on legitimate medical queries that score in the same band.
+  The LLM refusal clause (Layer 2) and the LangGraph grader (Layer 3)
+  carry the operational safety load. Layer 1 remains as a backstop, but
+  raising it would also reduce recall on legitimate medical queries that
+  score in the same band.
 - **LLM-as-judge variance.** Context precision averaged 0.40 across the
-  three chunk sizes. Inspection showed the retrieved chunks were
-  topically relevant; the variance reflects judge strictness, not
-  retrieval failure.
+  three chunk sizes pre-reranker. Inspection showed the retrieved chunks
+  were topically relevant; the variance reflects judge strictness, not
+  retrieval failure. Phase 3 reranker evaluation results will land here
+  after the next eval run.
 - **Evaluation set is small.** 25 queries in the stress test, 10 queries
-  in the chunking sweep. Results are directionally meaningful but not
-  statistically robust. A 50-100 query gold set with held-out reference
-  answers is the natural next step.
-- **No reranking or conversational memory.** Both are on the roadmap
-  below. Agentic orchestration (CRAG with document grading and retry)
-  was added in Phase 2 — see "Phase 2: Agentic upgrade" above.
+  in the chunking sweep, 6 in-corpus queries in the reranker comparison.
+  Results are directionally meaningful but not statistically robust. A
+  50-100 query gold set with held-out reference answers is the natural
+  next step.
+- **No conversational memory.** Multi-turn dialog where the agent
+  remembers context from earlier queries in the session is on the roadmap
+  below. Agentic orchestration (CRAG with document grading and retry) was
+  added in Phase 2; cross-encoder reranking was added in Phase 3.
 
 ---
 
@@ -477,7 +626,15 @@ Specific known limitations:
 LangGraph, with document relevance grading, query rewriting on poor
 retrieval, and bounded retries. Two-mode UI lets users compare against
 the baseline pipeline. See "Phase 2: Agentic upgrade" above for the
-architecture and validation. Items deferred to a future iteration:
+architecture and validation.
+
+**Phase 3: cross-encoder reranker — DONE.** `cross-encoder/ms-marco-MiniLM-L-6-v2`
+applied to the top-20 FAISS candidates before dedup. Empirically fixes
+the documented T-DXd retrieval failure on HER2-positive ADC queries —
+see "Phase 3: Cross-encoder reranker" above for the architecture and
+validation. Quantitative evaluation pending the next notebook run.
+
+**Items deferred to a future iteration:**
 
 - **Conversational memory.** Multi-turn dialog where the agent
   remembers context from earlier queries in the same session.
@@ -486,10 +643,10 @@ architecture and validation. Items deferred to a future iteration:
   corpus).
 - **Specific-NCT routing** so the agent recognizes `NCT0xxxxxxx`
   patterns and skips semantic retrieval in favor of direct lookup.
-
-**Reranker.** Cross-encoder (e.g., `cross-encoder/ms-marco-MiniLM-L-6-v2`)
-applied to the top-20 candidates before the dedup step. Should improve
-context precision more than any further chunking optimization.
+- **Biomedical cross-encoder.** Swap the generic MS-MARCO reranker
+  for a PubMedBERT-MS-MARCO variant. Likely improves the long tail of
+  rare-vocabulary queries that even the generic cross-encoder cannot
+  resolve.
 
 **Survival analysis hook.** Integrate Cox proportional hazards and
 Kaplan-Meier estimators on retrieved trial outcomes, so questions like
@@ -560,11 +717,27 @@ state mutators. Getting these conventions right took two debugging
 cycles; once the pattern was clear, every subsequent node was 10 lines
 and didn't need re-explanation.
 
+**Bi-encoder similarity floors are a property of the model class, not a
+bug to fix.** When the evaluation showed 0.40 context precision and
+adversarial queries scoring 0.91, the instinct was to chase tighter
+embeddings or a higher threshold. Neither would have worked. The
+bi-encoder compresses query and document into separate vectors before
+comparison — it never sees them together. For specialized clinical
+vocabulary that doesn't dominate the corpus (T-DXd appears in only a
+handful of protocols), the bi-encoder will rank a common-vocabulary
+chunk above the actually-relevant one, and no threshold tightens away
+the gap. The cross-encoder reranker isn't a *replacement* for the
+bi-encoder; it's a different kind of computation the bi-encoder
+fundamentally cannot do, and once I understood that, two-stage retrieval
+stopped feeling like a "fix" and started feeling like a class-of-model
+boundary I had been ignoring.
+
 ---
 
 ## Tech stack
 
-Python 3.13, sentence-transformers, FAISS, Groq API, LangGraph (agentic
+Python 3.13, sentence-transformers (PubMedBERT bi-encoder + MS-MARCO
+cross-encoder reranker), FAISS, Groq API, LangGraph (agentic
 orchestration), LangChain text splitters (recursive chunking only),
 Streamlit, pandas.
 
@@ -592,18 +765,19 @@ Reproduce the 25-query stress test:
 jupyter notebook notebooks/02_evaluation.ipynb
 ```
 
-Reproduce the chunking sweep:
+Reproduce the chunking sweep (and the Phase 3 reranker comparison in Step D):
 
 ```bash
 jupyter notebook notebooks/03_chunking_sweep.ipynb
 ```
 
-A free Groq API key is sufficient to run the system; the chunking-sweep
+A free Groq API key is sufficient to run the system. The full chunking-sweep
 evaluation uses approximately 100,000 tokens which fits inside the daily
-free-tier budget if run in a single session.
+free-tier budget if run in a single session; the Phase 3 reranker comparison
+in Step D adds approximately 40,000 tokens on top, so plan accordingly.
 
 ---
 
 ## License
 
-MIT.See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
