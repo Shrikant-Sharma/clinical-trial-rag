@@ -19,6 +19,7 @@ load_dotenv(override=True)
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
 LLM_MODEL = "llama-3.3-70b-versatile"
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_THRESHOLD = 0.50
 DEFAULT_K = 5
 FETCH_MULTIPLIER = 4
@@ -57,44 +58,89 @@ def load_model():
     return SentenceTransformer(EMBEDDING_MODEL)
 
 
+def load_reranker():
+    """Load the cross-encoder reranker used for second-stage scoring.
+
+    Caches at app level via @st.cache_resource in app.py. First call
+    downloads ~80MB to ~/.cache/huggingface/hub/.
+    """
+    from sentence_transformers import CrossEncoder
+    return CrossEncoder(RERANKER_MODEL)
+
+
 def make_groq_client():
     """Create a Groq client. Reads GROQ_API_KEY from environment."""
     return Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ---- Retrieval and generation ----
-def retrieve(query, model, index, chunks, k=DEFAULT_K, fetch_multiplier=FETCH_MULTIPLIER):
+def retrieve(query, model, index, chunks, k=DEFAULT_K, fetch_multiplier=FETCH_MULTIPLIER, reranker=None):
     """
-    Encode query, fetch (k * fetch_multiplier) chunks from FAISS, dedup
-    by nct_id, return top-k unique sources with cosine similarity scores.
+    Encode query, fetch (k * fetch_multiplier) chunks from FAISS, optionally
+    rerank with a cross-encoder, dedup by nct_id, return top-k unique sources.
+
+    When `reranker` is None the function behaves identically to the original
+    single-stage retrieval. When a cross-encoder is provided, all fetched
+    candidates are rescored BEFORE dedup so the best chunk per trial (per the
+    cross-encoder) is the one that survives, not just the best FAISS chunk.
+    The cosine `score` field is preserved for the agent's threshold gate.
     """
     query_vec = model.encode(
         [query],
         normalize_embeddings=True,
         convert_to_numpy=True,
     ).astype(np.float32)
-
     fetch_k = k * fetch_multiplier
     distances, indices = index.search(query_vec, fetch_k)
 
-    seen_nct_ids = set()
-    results = []
+    # Materialize all candidates with cosine similarity (no dedup yet).
+    candidates = []
     for dist, idx in zip(distances[0], indices[0]):
         chunk = chunks[idx]
-        if chunk["nct_id"] in seen_nct_ids:
-            continue
-        seen_nct_ids.add(chunk["nct_id"])
         cosine_sim = 1 - (dist / 2)
-        results.append({
-            "rank": len(results) + 1,
+        candidates.append({
             "score": float(cosine_sim),
             "nct_id": chunk["nct_id"],
             "title": chunk["title"],
             "text": chunk["text"],
         })
+
+    # Optional cross-encoder rerank BEFORE dedup. Reranking after dedup
+    # would only re-order the already-chosen chunks; reranking before lets
+    # the cross-encoder choose which chunk per trial is most relevant.
+    if reranker is not None:
+        candidates = rerank(query, candidates, reranker)
+
+    # Dedup by nct_id, walking in current sort order (FAISS or reranked).
+    seen_nct_ids = set()
+    results = []
+    for cand in candidates:
+        if cand["nct_id"] in seen_nct_ids:
+            continue
+        seen_nct_ids.add(cand["nct_id"])
+        cand["rank"] = len(results) + 1
+        results.append(cand)
         if len(results) >= k:
             break
     return results
+
+
+def rerank(query: str, candidates: list, reranker) -> list:
+    """Re-score retrieved candidates against the query with a cross-encoder.
+
+    Each candidate dict must have a 'text' field. Adds a 'rerank_score'
+    field (float) to every candidate and returns the list sorted by
+    rerank_score descending. The cross-encoder reads both query and
+    document together, which catches relevance that bi-encoder cosine
+    similarity dilutes (this is the whole point of two-stage retrieval).
+    """
+    if not candidates:
+        return candidates
+    pairs = [(query, c["text"]) for c in candidates]
+    scores = reranker.predict(pairs)
+    for c, s in zip(candidates, scores):
+        c["rerank_score"] = float(s)
+    return sorted(candidates, key=lambda c: c["rerank_score"], reverse=True)
 
 
 def build_context(results):
@@ -128,14 +174,14 @@ def generate_answer(query, results, client):
     return response.choices[0].message.content
 
 
-def generate(query, client, model, index, chunks, k=DEFAULT_K, threshold=DEFAULT_THRESHOLD):
+def generate(query, client, model, index, chunks, k=DEFAULT_K, threshold=DEFAULT_THRESHOLD, reranker=None):
     """
     Full RAG pipeline: retrieve -> threshold check (Layer 1) ->
     Groq generation with refusal clause (Layer 2).
 
     Returns dict with: answer, sources, top_score, refused_at.
     """
-    results = retrieve(query, model, index, chunks, k=k)
+    results = retrieve(query, model, index, chunks, k=k, reranker=reranker)
     top_score = results[0]["score"] if results else 0.0
 
     # Layer 1: similarity threshold (catches catastrophic OOD)
@@ -149,9 +195,11 @@ def generate(query, client, model, index, chunks, k=DEFAULT_K, threshold=DEFAULT
 
     # Layer 2: LLM with refusal clause in system prompt
     answer = generate_answer(query, results, client)
+    canonical_refusal = "I don't have enough information in the retrieved trials"
+    is_refusal = canonical_refusal in answer
     return {
         "answer": answer,
-        "sources": results,
+        "sources": [] if is_refusal else results,
         "top_score": top_score,
-        "refused_at": None,
+        "refused_at": "generation" if is_refusal else None,
     }

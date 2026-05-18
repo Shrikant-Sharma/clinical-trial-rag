@@ -99,7 +99,7 @@ class AgentState(TypedDict):
 
 
 # ---- Nodes ----
-def _retrieve_node(state: AgentState, model, index, chunks) -> dict:
+def _retrieve_node(state, *, model, index, chunks, reranker=None) -> dict:
     """
     Retrieve top-k documents for the current query.
 
@@ -111,7 +111,8 @@ def _retrieve_node(state: AgentState, model, index, chunks) -> dict:
     in a later step binds them via functools.partial so LangGraph sees
     a 1-arg callable.
     """
-    results = retrieve(state["current_query"], model, index, chunks)
+    results = retrieve(state["current_query"], model,
+                       index, chunks, reranker=reranker)
     top_score = results[0]["score"] if results else 0.0
     return {"documents": results, "top_score": top_score}
 
@@ -261,7 +262,7 @@ def _route_after_grade(state: AgentState) -> str:
 
 
 # ---- Graph assembly ----
-def build_agent(client, model, index, chunks):
+def build_agent(client, model, index, chunks, reranker=None):
     """
     Build and compile the self-corrective RAG agent.
 
@@ -285,7 +286,7 @@ def build_agent(client, model, index, chunks):
 
     # Bind dependencies to each node.
     retrieve_node = partial(_retrieve_node, model=model,
-                            index=index, chunks=chunks)
+                            index=index, chunks=chunks, reranker=reranker)
     grade_node = partial(_grade_documents, client=client)
     rewrite_node = partial(_rewrite_query, client=client)
     generate_node = partial(_generate_node, client=client)
