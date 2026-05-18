@@ -12,6 +12,7 @@ Run with: streamlit run app.py
 """
 
 import streamlit as st
+from groq import RateLimitError, APIError
 
 from src.rag import (
     load_chunks,
@@ -143,6 +144,31 @@ with st.sidebar:
             st.session_state["query"] = ex
 
 
+def handle_llm_error(e):
+    """Catch Groq API failures and render a friendly message instead of a traceback."""
+    if isinstance(e, RateLimitError):
+        st.error(
+            "⏱️ **Daily LLM quota reached**\n\n"
+            "This demo runs on Groq's free-tier API, which caps daily token usage. "
+            "The quota resets within 24 hours — please check back tomorrow. "
+            "The retrieval pipeline (PubMedBERT + FAISS + cross-encoder reranker) "
+            "is working normally; only the LLM generation step is rate-limited."
+        )
+    elif isinstance(e, APIError):
+        st.error(
+            f"⚠️ **LLM API error** ({type(e).__name__})\n\n"
+            "The upstream LLM provider returned an error. Please try again "
+            "in a moment, or refresh the page."
+        )
+    else:
+        st.error(
+            f"⚠️ **Unexpected error** ({type(e).__name__})\n\n"
+            f"{str(e)[:300]}\n\n"
+            "Please try a different query or check back later."
+        )
+    st.stop()
+
+
 # Build agent graph AFTER use_reranker is defined in the sidebar.
 agent_graph = _load_agent(use_reranker)
 
@@ -161,14 +187,17 @@ if query:
         else "Retrieving and generating..."
     )
     with st.spinner(spinner_text):
-        if is_agentic:
-            result = run_agent(query, agent_graph)
-        else:
-            reranker = _load_reranker() if use_reranker else None
-            result = generate(
-                query, client, model, index, chunks,
-                k=k, threshold=threshold, reranker=reranker,
-            )
+        try:
+            if is_agentic:
+                result = run_agent(query, agent_graph)
+            else:
+                reranker = _load_reranker() if use_reranker else None
+                result = generate(
+                    query, client, model, index, chunks,
+                    k=k, threshold=threshold, reranker=reranker,
+                )
+        except Exception as e:
+            handle_llm_error(e)
 
     # ---- Status row: similarity + outcome ----
     col1, col2 = st.columns([1, 3])
