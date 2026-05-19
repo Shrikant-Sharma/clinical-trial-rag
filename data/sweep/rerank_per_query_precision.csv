@@ -1,0 +1,7 @@
+query,no_rr,rerank,delta
+Are there trials studying antibody drug conjugates for HER2 positive cancer?,0.0,0.0,0.0
+What are reported hazard ratios for overall survival in phase 3 oncology trials?,0.0,0.0,0.0
+What are the eligibility criteria for trials enrolling patients age 65 and older?,0.0,0.2,0.2
+What trials use CAR-T cell therapy for leukemia or lymphoma?,0.0,0.0,0.0
+What trials use pembrolizumab in non-small cell lung cancer?,0.4,0.4,0.0
+Which trials target the BRAF V600E mutation?,0.0,0.0,0.0

@@ -1,0 +1,3 @@
+config,n_total,n_answered,n_refused,refusal_rate,faith_when_answered,ctx_precision_all,ctx_precision_answered
+no reranker,6,2,4,0.667,0.812,0.067,0.2
+with reranker,6,4,2,0.333,0.812,0.1,0.15
