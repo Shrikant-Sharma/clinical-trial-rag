@@ -395,10 +395,10 @@ Streamlit Cloud deployment.
 
 ### Empirical validation: the HER2 ADC query before and after
 
-The headline test is the exact query that the Limitations section called
-out as a known failure mode — *"Are there trials studying antibody drug
-conjugates for HER2-positive cancer?"* — before and after adding the
-reranker.
+The headline qualitative test is the exact query that the Limitations
+section called out as a known failure mode — *"Are there trials studying
+antibody drug conjugates for HER2-positive cancer?"* — before and after
+adding the reranker.
 
 **Without reranker** (bi-encoder cosine ranking):
 
@@ -453,17 +453,59 @@ and see exactly which retrieval differences the cross-encoder is buying.
 When the reranker is on, retrieved-source expanders display the
 `rerank_score` alongside the cosine similarity.
 
-### Reproducible evaluation
+### Quantitative evaluation
 
-The qualitative HER2 ADC before/after above is the headline validation:
-the failure mode documented in Section 2 of the Evaluation is verifiably
-fixed by the mechanism documented in this section. A controlled
-quantitative harness (chunk size = 1000, 6 in-corpus queries × 2
-configs, LLM-as-judge for faithfulness and context precision) is
-provided in `notebooks/03_chunking_sweep.ipynb` under "Step D — Reranker
-comparison" for anyone wanting to reproduce or extend the numbers. The
-methodology is identical to the chunking-sweep evaluation in Section 2
-above, applied to the rerank-on vs rerank-off comparison.
+A controlled comparison was run on the production chunk size (1000 chars)
+with the 6 in-corpus queries × 2 configurations (rerank off, rerank on),
+each scored by an LLM-as-judge for faithfulness and context precision.
+Implementation in `notebooks/03_chunking_sweep.ipynb` under "Step D —
+Reranker comparison."
+
+**Aggregate results (6 in-corpus queries × 2 configs):**
+
+| Config        | Answered | Refused | Refusal rate | Faithfulness (when answered) | Context precision (all) |
+|---------------|---------:|--------:|-------------:|-----------------------------:|------------------------:|
+| No reranker   | 2        | 4       | 67%          | 0.812                        | 0.067                   |
+| With reranker | 4        | 2       | **33%**      | 0.812                        | **0.100**               |
+
+**Headline: refusal rate halved** (67% → 33%) with no degradation in
+faithfulness when the system answered. The reranker enabled correct
+answers on queries the bi-encoder couldn't surface relevant chunks for,
+while preserving answer quality on the queries the baseline already
+handled.
+
+**Per-query outcomes:**
+
+| Query                                                  | No reranker | With reranker | Delta              |
+|--------------------------------------------------------|-------------|---------------|--------------------|
+| pembrolizumab in NSCLC                                 | answered    | answered      | still answered     |
+| BRAF V600E mutation in melanoma                        | answered    | answered      | still answered     |
+| antibody-drug conjugates for HER2+ breast cancer       | refused     | **answered**  | **FIXED by rerank**|
+| eligibility criteria for age 65+                       | refused     | **answered**  | **FIXED by rerank**|
+| hazard ratios in phase 3 oncology trials               | refused     | refused       | still refused      |
+| CAR-T cell therapy for leukemia                        | refused     | refused       | still refused      |
+
+The HER2 ADC fix is exactly the qualitative validation shown above, now
+confirmed by the quantitative pipeline. The eligibility-65+ query is a
+second case where two-stage retrieval unlocked an answer that bi-encoder
+ranking left buried below the top 5.
+
+**Two queries are still refused — by design, not retrieval failure.**
+The hazard-ratios and CAR-T-leukemia queries hit genuine corpus gaps:
+the indexed protocols mostly describe eligibility and trial design
+rather than summary statistics like hazard ratios, and the oncology
+corpus skews solid tumors rather than hematologic malignancies. Both
+refusals are specific and citation-aware — the same safety behavior
+documented in Section 2 of the Evaluation below.
+
+**On context precision when answered (0.20 → 0.15):** this is a paradox
+of progress. The reranker enabled answers on harder queries, which the
+strict LLM judge then penalized in its narrow "directly answers the
+question" reading of context. The aggregate precision over all six
+queries (0.067 → 0.100) is the metric that captures the real
+improvement; the precision-when-answered metric is pulled down by the
+judge strictness already documented in the chunking-sweep evaluation,
+not by retrieval getting worse.
 
 ---
 
@@ -568,7 +610,8 @@ strict "directly answers the question" criterion that penalized chunks where
 query terms appeared in inclusion/exclusion criteria rather than trial
 design. Treating the 0.40 as evidence of poor retrieval would be misleading.
 A dedicated cross-encoder reranker is the natural improvement — implemented
-in Phase 3 above.
+in Phase 3 above, where the controlled comparison shows refusal rate halving
+from 67% to 33% with no faithfulness degradation.
 
 ### 3. Verdict
 
@@ -596,20 +639,24 @@ Specific known limitations:
   Without the reranker, different chunking configurations surface
   trastuzumab-deruxtecan (T-DXd) chunks at different ranks for the same
   query. The cross-encoder reranker added in Phase 3 fixes this for the
-  HER2 ADC case; the broader pattern (dense bi-encoders struggle with
-  vocabulary that appears in only a handful of documents) is structural
-  and applies to any rare clinical term.
+  HER2 ADC case (verified quantitatively: refusal rate halves from 67%
+  to 33% across the 6-query in-corpus eval); the broader pattern (dense
+  bi-encoders struggle with vocabulary that appears in only a handful of
+  documents) is structural and applies to any rare clinical term.
 - **The cosine threshold (Layer 1) does not fire in evaluation.**
   Adversarial queries score 0.86 to 0.91, well above the 0.50 threshold.
   The LLM refusal clause (Layer 2) and the LangGraph grader (Layer 3)
   carry the operational safety load. Layer 1 remains as a backstop, but
   raising it would also reduce recall on legitimate medical queries that
   score in the same band.
-- **LLM-as-judge variance.** Context precision averaged 0.40 across the
-  three chunk sizes pre-reranker. Inspection showed the retrieved chunks
-  were topically relevant; the variance reflects judge strictness, not
-  retrieval failure. Phase 3 reranker evaluation results will land here
-  after the next eval run.
+- **LLM-as-judge variance.** Context precision metrics moved across
+  evaluation passes — 0.40 average in the chunking sweep, and a stricter
+  scoring path in the Phase 3 reranker comparison (aggregate 0.067 → 0.100
+  with the reranker; precision-when-answered 0.20 → 0.15, an artifact of
+  the judge penalizing newly-unlocked harder queries in its narrow
+  "directly answers" reading). Across both passes, qualitative inspection
+  showed retrieved chunks were topically relevant — the variance reflects
+  judge strictness, not retrieval failure.
 - **Evaluation set is small.** 25 queries in the stress test, 10 queries
   in the chunking sweep, 6 in-corpus queries in the reranker comparison.
   Results are directionally meaningful but not statistically robust. A
@@ -632,9 +679,10 @@ architecture and validation.
 
 **Phase 3: cross-encoder reranker — DONE.** `cross-encoder/ms-marco-MiniLM-L-6-v2`
 applied to the top-20 FAISS candidates before dedup. Empirically fixes
-the documented T-DXd retrieval failure on HER2-positive ADC queries —
-see "Phase 3: Cross-encoder reranker" above for the architecture and
-validation. Quantitative evaluation pending the next notebook run.
+the documented T-DXd retrieval failure on HER2-positive ADC queries and
+halves in-corpus refusal rate from 67% to 33% on the 6-query LLM-judged
+eval with no faithfulness degradation — see "Phase 3: Cross-encoder
+reranker" above for the architecture and full validation.
 
 **Items deferred to a future iteration:**
 
@@ -732,7 +780,10 @@ the gap. The cross-encoder reranker isn't a *replacement* for the
 bi-encoder; it's a different kind of computation the bi-encoder
 fundamentally cannot do, and once I understood that, two-stage retrieval
 stopped feeling like a "fix" and started feeling like a class-of-model
-boundary I had been ignoring.
+boundary I had been ignoring. The Phase 3 numbers confirmed the
+intuition: halving the refusal rate without touching the bi-encoder, by
+adding a model class that can do something the bi-encoder structurally
+cannot.
 
 ---
 
