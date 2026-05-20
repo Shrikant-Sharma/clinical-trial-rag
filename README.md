@@ -333,7 +333,7 @@ sharper retrieval, while baseline takes the original query as-is.
 The chunking-sweep evaluation in the previous build flagged a real
 retrieval limitation: context precision averaged 0.40 across all three
 chunk sizes, and the trastuzumab-deruxtecan (T-DXd) chunk for the
-HER2-positive antibody-drug-conjugate query was ranked lower than the
+HER2-positive antibody-drug conjugate query was ranked lower than the
 generic trastuzumab-and-chemotherapy studies. The original Limitations
 section called out this exact pattern: *"Different chunking configurations
 surface T-DXd chunks at different ranks for the same query. Retrieval is
@@ -597,7 +597,7 @@ gap, and refused with citations. That is what good clinical RAG looks like.
 
 **The chunking choice does not meaningfully affect safety.** Five of six
 queries had identical answered/refused outcomes across all three sizes. The
-only point of disagreement is the antibody-drug-conjugate query: 500-char
+only point of disagreement is the antibody-drug conjugate query: 500-char
 answered (correctly hedged), 1000 and 1500 refused. All three answers were
 correct in the sense that none confabulated. They represent a gradient of
 caution: 500-char gave a useful partial answer, 1000-char refused with
