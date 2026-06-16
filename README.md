@@ -48,6 +48,40 @@ honestly against each failure mode.
 
 ```mermaid
 flowchart LR
+    A[ClinicalTrials.gov API] --> B[484 oncology trials<br/>5 disease areas]
+    B --> C[Recursive chunking<br/>1000 chars / 200 overlap]
+    C --> D[PubMedBERT embeddings<br/>768-dim, normalized]
+    D --> E[(FAISS IndexFlatL2<br/>3,264 vectors)]
+
+    Q[User query] --> QE[PubMedBERT encode]
+    QE --> R[Retrieve top-20]
+    E -.-> R
+    R --> G1{Gate 1<br/>cosine above threshold?}
+    G1 -->|no| REF[Refuse with reason]
+    G1 -->|yes| RR[Cross-encoder rerank<br/>MS-MARCO MiniLM]
+    RR --> DD[Dedup by NCT ID<br/>top-5 unique trials]
+    DD --> GR[LLM-as-judge grades documents]
+    GR --> G2{Gate 2<br/>relevant?}
+    G2 -->|yes| GEN[Llama 3.3 70B<br/>generate grounded answer]
+    G2 -->|retry| RW[Rewrite query]
+    RW --> R
+    G2 -->|exhausted| REF
+    GEN --> G3{Gate 3<br/>answer grounded?}
+    G3 -->|no| REF
+    G3 -->|yes| OUT[Cited answer<br/>NCT IDs]
+```
+
+The indexing pipeline runs once. The query pipeline runs per request, in
+roughly 1.5 seconds end-to-end (PubMedBERT loaded once at app startup via
+`@st.cache_resource`).
+
+The system also runs a baseline single-shot mode (cosine threshold plus
+refusal clause, no grading or reranking) for A/B comparison; see Phase 2.
+
+### Baseline mode (for comparison)
+
+```mermaid
+flowchart LR
     A[ClinicalTrials.gov API] --> B[484 unique trials<br/>5 disease areas]
     B --> C[Recursive chunking<br/>1000 chars / 200 overlap]
     C --> D[PubMedBERT embeddings<br/>768-dim, normalized]
@@ -62,10 +96,6 @@ flowchart LR
     L1 -->|yes| L2[Llama 3.3 70B<br/>+ refusal clause in system prompt]
     L2 --> OUT[Cited answer<br/>or scope-aware refusal]
 ```
-
-The indexing pipeline runs once. The query pipeline runs per request, in
-roughly 1.5 seconds end-to-end (PubMedBERT loaded once at app startup via
-`@st.cache_resource`).
 
 ---
 
@@ -164,7 +194,7 @@ relevant trials at lower ranks.
 ```python
 def retrieve(query, model, index, chunks, k=5, fetch_multiplier=4, reranker=None):
     # Fetch 4*k = 20 candidates from FAISS
-    # (Optional) cross-encoder rescores all 20 — see Phase 3
+    # (Optional) cross-encoder rescores all 20, see Phase 3
     # Walk in score order, keep best-scoring chunk per nct_id
     # Return top-5 unique trials
 ```
@@ -224,7 +254,7 @@ legitimate medical queries also score in the 0.85+ band.
 The 25-query stress test and the chunking sweep both surfaced the same
 finding: **Layer 1 (the cosine similarity threshold) never fires in
 practice**. Adversarial out-of-domain queries score 0.86 to 0.91. The
-threshold sits at 0.50. PubMedBERT — like most dense bi-encoders — has a
+threshold sits at 0.50. PubMedBERT, like most dense bi-encoders, has a
 high similarity floor; even gibberish (`asdf qwer zxcv lkjh`) scored 0.914
 against the clinical corpus.
 
@@ -244,14 +274,14 @@ literature, implemented via LangGraph for the orchestration.
 ### Why LangGraph (and only for orchestration)
 
 The baseline retrieval and generation path in `rag.py` intentionally
-avoids LangChain — embeddings, FAISS, and the Groq client are all called
+avoids LangChain: embeddings, FAISS, and the Groq client are all called
 directly. LangGraph (a library from the LangChain team) is used in
 `agent.py` purely for state-machine orchestration: defining nodes,
 conditional edges, and the retry loop. Core retrieval and generation are
 unchanged. The reasoning:
 
 - **Orchestration is the part LangGraph does well.** State management,
-  conditional routing, retry loops with cycle detection — implementing
+  conditional routing, retry loops with cycle detection. Implementing
   these manually is hundreds of lines of boilerplate with subtle bugs.
 - **Retrieval is the part where abstraction creates more problems than
   it solves.** LangChain's retrievers add wrappers that hide important
@@ -284,7 +314,7 @@ flowchart LR
 Five nodes: `retrieve`, `grade`, `rewrite_query`, `generate`, `refuse`.
 Two conditional edges: after `retrieve` (threshold check), after `grade`
 (three-way fork on relevance and retry count). The rewrite path loops
-back to `retrieve` exactly once before refusing — `MAX_RETRIES = 1` is a
+back to `retrieve` exactly once before refusing. `MAX_RETRIES = 1` is a
 deliberate hyperparameter. Empirically, one rewrite recovers most
 vague-question failures; beyond one, the question is usually genuinely
 out of scope and refusing is correct.
@@ -297,7 +327,7 @@ The agent has three independent refusal paths, each with a distinct
 | Gate | When it fires | What it catches |
 |---|---|---|
 | `threshold` | top cosine < 0.50 after retrieve | Catastrophic OOD (gibberish, malformed input). Rarely fires in practice. |
-| `max_retries_exhausted` | grader returns `not_relevant` after retry | Topically-adjacent but actually irrelevant retrieval — the gap embeddings can't see. |
+| `max_retries_exhausted` | grader returns `not_relevant` after retry | Topically-adjacent but actually irrelevant retrieval (the gap embeddings can't see). |
 | `generation` | LLM emits the canonical refusal phrase from `SYSTEM_PROMPT` | On-topic retrieval that doesn't actually contain the answer to the specific question (e.g., asking about side effects against a protocol-only corpus). |
 
 The empirical validation that all three gates do distinct work came from
@@ -314,8 +344,8 @@ literal.
 
 The Streamlit app exposes both modes as a sidebar toggle:
 
-- **Agentic (CRAG)** — the new flow. Default.
-- **Baseline (single-shot)** — original `retrieve → threshold → generate`,
+- **Agentic (CRAG):** the new flow. Default.
+- **Baseline (single-shot):** original `retrieve → threshold → generate`,
   preserved verbatim.
 
 Both share the same retrieval, embedding model, FAISS index, and base LLM
@@ -343,7 +373,7 @@ corpus."*
 The root cause is structural to the bi-encoder retrieval approach. A
 dense bi-encoder embedding (PubMedBERT here) compresses query and document
 into separate vectors that get compared by cosine similarity. That's fast
-and scales — but the encoder never sees the two together, it only scores
+and scales, but the encoder never sees the two together, it only scores
 similarity to a global semantic geometry. For specialized clinical
 vocabulary that doesn't dominate the corpus (T-DXd appears in only a
 handful of protocols), the bi-encoder will rank a more common-vocabulary
@@ -384,7 +414,7 @@ def retrieve(query, model, index, chunks, k=5, fetch_multiplier=4, reranker=None
     calibrated."""
 ```
 
-The reranker is `cross-encoder/ms-marco-MiniLM-L-6-v2` — 22M parameters,
+The reranker is `cross-encoder/ms-marco-MiniLM-L-6-v2`, 22M parameters,
 about 90MB, fast on CPU (~50ms for 20 query-document pairs). Trained on
 the MS-MARCO passage ranking dataset, it generalizes well to clinical
 text despite not being domain-specific. A biomedical-tuned cross-encoder
@@ -396,8 +426,8 @@ Streamlit Cloud deployment.
 ### Empirical validation: the HER2 ADC query before and after
 
 The headline qualitative test is the exact query that the Limitations
-section called out as a known failure mode — *"Are there trials studying
-antibody drug conjugates for HER2-positive cancer?"* — before and after
+section called out as a known failure mode, *"Are there trials studying
+antibody drug conjugates for HER2-positive cancer?"*, before and after
 adding the reranker.
 
 **Without reranker** (bi-encoder cosine ranking):
@@ -416,7 +446,7 @@ antibody-drug conjugates specifically. The Agentic CRAG mode correctly
 **refused** this set: the LLM grader judged the chunks topically related,
 but the generator could not produce an ADC-grounded answer, so the
 canonical refusal phrase fired and `refused_at="generation"` was
-attributed. Layer 3 saved the user from a confabulated answer — exactly
+attributed. Layer 3 saved the user from a confabulated answer, exactly
 as designed.
 
 **With reranker** (cross-encoder rescoring):
@@ -458,8 +488,8 @@ When the reranker is on, retrieved-source expanders display the
 A controlled comparison was run on the production chunk size (1000 chars)
 with the 6 in-corpus queries × 2 configurations (rerank off, rerank on),
 each scored by an LLM-as-judge for faithfulness and context precision.
-Implementation in `notebooks/03_chunking_sweep.ipynb` under "Step D —
-Reranker comparison."
+Implementation in `notebooks/03_chunking_sweep.ipynb` under the "Step D"
+reranker comparison.
 
 **Aggregate results (6 in-corpus queries × 2 configs):**
 
@@ -490,12 +520,12 @@ confirmed by the quantitative pipeline. The eligibility-65+ query is a
 second case where two-stage retrieval unlocked an answer that bi-encoder
 ranking left buried below the top 5.
 
-**Two queries are still refused — by design, not retrieval failure.**
+**Two queries are still refused, by design, not retrieval failure.**
 The hazard-ratios and CAR-T-leukemia queries hit genuine corpus gaps:
 the indexed protocols mostly describe eligibility and trial design
 rather than summary statistics like hazard ratios, and the oncology
 corpus skews solid tumors rather than hematologic malignancies. Both
-refusals are specific and citation-aware — the same safety behavior
+refusals are specific and citation-aware, the same safety behavior
 documented in Section 2 of the Evaluation below.
 
 **On context precision when answered (0.20 → 0.15):** this is a paradox
@@ -533,7 +563,7 @@ for "antibody-drug conjugates in HER2-positive cancer" but ranked the
 trastuzumab-deruxtecan chunk lower than expected. The corpus contained the
 chunk; retrieval recovered it; the LLM's answer correctly hedged the
 HER2-low vs HER2-positive distinction. **This finding directly motivated
-Phase 3 — see "Cross-encoder reranker" above for the architectural fix
+Phase 3. See "Cross-encoder reranker" above for the architectural fix
 and validation.**
 
 ### 2. Chunking sweep: 3 chunk sizes, RAGAS-equivalent metrics
@@ -609,7 +639,7 @@ all five retrieved chunks were topically relevant; the LLM judge applied a
 strict "directly answers the question" criterion that penalized chunks where
 query terms appeared in inclusion/exclusion criteria rather than trial
 design. Treating the 0.40 as evidence of poor retrieval would be misleading.
-A dedicated cross-encoder reranker is the natural improvement — implemented
+A dedicated cross-encoder reranker is the natural improvement, implemented
 in Phase 3 above, where the controlled comparison shows refusal rate halving
 from 67% to 33% with no faithfulness degradation.
 
@@ -635,7 +665,7 @@ Specific known limitations:
   boilerplate rather than the chunks containing the specific numerical
   value. The embedding matches structural patterns ("Eligibility:
   Inclusion Criteria") more strongly than numerical content.
-- **Vocabulary fragility on emerging therapies — mitigated by Phase 3.**
+- **Vocabulary fragility on emerging therapies, mitigated by Phase 3.**
   Without the reranker, different chunking configurations surface
   trastuzumab-deruxtecan (T-DXd) chunks at different ranks for the same
   query. The cross-encoder reranker added in Phase 3 fixes this for the
@@ -650,12 +680,12 @@ Specific known limitations:
   raising it would also reduce recall on legitimate medical queries that
   score in the same band.
 - **LLM-as-judge variance.** Context precision metrics moved across
-  evaluation passes — 0.40 average in the chunking sweep, and a stricter
+  evaluation passes: 0.40 average in the chunking sweep, and a stricter
   scoring path in the Phase 3 reranker comparison (aggregate 0.067 → 0.100
   with the reranker; precision-when-answered 0.20 → 0.15, an artifact of
   the judge penalizing newly-unlocked harder queries in its narrow
   "directly answers" reading). Across both passes, qualitative inspection
-  showed retrieved chunks were topically relevant — the variance reflects
+  showed retrieved chunks were topically relevant, so the variance reflects
   judge strictness, not retrieval failure.
 - **Evaluation set is small.** 25 queries in the stress test, 10 queries
   in the chunking sweep, 6 in-corpus queries in the reranker comparison.
@@ -671,17 +701,17 @@ Specific known limitations:
 
 ## Roadmap
 
-**Phase 2: agentic upgrade — DONE.** Corrective RAG (CRAG) pattern via
+**Phase 2 agentic upgrade: DONE.** Corrective RAG (CRAG) pattern via
 LangGraph, with document relevance grading, query rewriting on poor
 retrieval, and bounded retries. Two-mode UI lets users compare against
 the baseline pipeline. See "Phase 2: Agentic upgrade" above for the
 architecture and validation.
 
-**Phase 3: cross-encoder reranker — DONE.** `cross-encoder/ms-marco-MiniLM-L-6-v2`
+**Phase 3 cross-encoder reranker: DONE.** `cross-encoder/ms-marco-MiniLM-L-6-v2`
 applied to the top-20 FAISS candidates before dedup. Empirically fixes
 the documented T-DXd retrieval failure on HER2-positive ADC queries and
 halves in-corpus refusal rate from 67% to 33% on the 6-query LLM-judged
-eval with no faithfulness degradation — see "Phase 3: Cross-encoder
+eval with no faithfulness degradation. See "Phase 3: Cross-encoder
 reranker" above for the architecture and full validation.
 
 **Items deferred to a future iteration:**
@@ -747,21 +777,20 @@ judge was strict. Reading the actual judgements before reporting the
 aggregate is the difference between a defensible metric and a misleading one.
 
 **Defense in depth means each layer can be lenient.** The threshold gate
-at 0.50 doesn't catch most OOD — natural-language gibberish scores 0.91.
+at 0.50 doesn't catch most OOD, since natural-language gibberish scores 0.91.
 That used to feel like a problem with the threshold. After adding the
 LLM relevance grader as a second independent defense, the lenience of
 any single gate stopped mattering: as long as one of the three
 (threshold, grader, max-retries) catches each OOD case, the system is
-safe. Each gate can specialize — threshold for speed, grader for
-semantic precision, retry-cap for guarantees. This is why defense in
-depth beats a single perfect filter in practice, and it's the
-architectural argument for the agentic upgrade as much as anything in
-the CRAG paper.
+safe. Each gate can specialize: threshold for speed, grader for semantic
+precision, retry-cap for guarantees. This is why defense in depth beats
+a single perfect filter in practice, and it's the architectural argument
+for the agentic upgrade as much as anything in the CRAG paper.
 
 **LangGraph state mutation has a learning curve worth flagging.**
 TypedDict for state is idiomatic and lightweight, but each node must
-return a *partial* state dict that LangGraph merges into the full state
-— not the full state directly, or you'd lose other nodes' updates.
+return a *partial* state dict that LangGraph merges into the full state,
+not the full state directly, or you'd lose other nodes' updates.
 Conditional edge functions are pure routing (they return a string), not
 state mutators. Getting these conventions right took two debugging
 cycles; once the pattern was clear, every subsequent node was 10 lines
@@ -772,7 +801,7 @@ bug to fix.** When the evaluation showed 0.40 context precision and
 adversarial queries scoring 0.91, the instinct was to chase tighter
 embeddings or a higher threshold. Neither would have worked. The
 bi-encoder compresses query and document into separate vectors before
-comparison — it never sees them together. For specialized clinical
+comparison; it never sees them together. For specialized clinical
 vocabulary that doesn't dominate the corpus (T-DXd appears in only a
 handful of protocols), the bi-encoder will rank a common-vocabulary
 chunk above the actually-relevant one, and no threshold tightens away
