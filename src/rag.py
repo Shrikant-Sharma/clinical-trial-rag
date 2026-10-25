@@ -18,7 +18,25 @@ load_dotenv(override=True)
 # ---- Config ----
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
-LLM_MODEL = "llama-3.3-70b-versatile"
+
+# Generator LLM. Groq decommissioned `llama-3.3-70b-versatile` on 2026-08-16
+# (second deprecation this project has absorbed). openai/gpt-oss-120b is
+# Groq's recommended replacement and their current production-tier model.
+LLM_MODEL = "openai/gpt-oss-120b"
+
+# GPT-OSS is a reasoning model: it always emits reasoning tokens before the
+# answer, and those tokens count against max_tokens and the daily budget.
+# `low` keeps them short; `include_reasoning=False` drops the reasoning text
+# from the response so callers see the same shape they always did.
+# Passed via extra_body so the groq==0.11.0 pin on Streamlit Cloud (which
+# predates these keywords) still works. Swap the model: edit these two lines.
+LLM_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
+
+# Canonical refusal phrase from SYSTEM_PROMPT rule 1. Both the baseline and
+# agentic paths detect it; an empty LLM response is mapped onto it so the
+# system fails closed rather than presenting nothing as an answer.
+CANONICAL_REFUSAL = "I don't have enough information in the retrieved trials to answer that question."
+
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_THRESHOLD = 0.50
 DEFAULT_K = 5
@@ -169,9 +187,20 @@ def generate_answer(query, results, client):
             {"role": "user", "content": user_message},
         ],
         temperature=0.1,
-        max_tokens=400,
+        # Headroom, not a target: the answer is still 2-4 sentences per the
+        # system prompt, but reasoning tokens share this budget on GPT-OSS.
+        max_tokens=1024,
+        extra_body=LLM_EXTRA_BODY,
     )
-    return response.choices[0].message.content
+    answer = (response.choices[0].message.content or "").strip()
+    # GPT-OSS tends to emit citations in fullwidth brackets (【NCT…】), a
+    # habit from its training data, despite the prompt asking for [NCT…].
+    # Normalize at the boundary instead of fighting the prompt.
+    answer = answer.replace("【", "[").replace("】", "]")
+    # Fail closed: an empty answer (e.g. budget exhausted during reasoning)
+    # becomes a refusal, which both callers detect, rather than a blank
+    # "answer" shown next to cited sources.
+    return answer or CANONICAL_REFUSAL
 
 
 def generate(query, client, model, index, chunks, k=DEFAULT_K, threshold=DEFAULT_THRESHOLD, reranker=None):
@@ -187,7 +216,7 @@ def generate(query, client, model, index, chunks, k=DEFAULT_K, threshold=DEFAULT
     # Layer 1: similarity threshold (catches catastrophic OOD)
     if top_score < threshold:
         return {
-            "answer": "I don't have enough information in the retrieved trials to answer that question.",
+            "answer": CANONICAL_REFUSAL,
             "sources": [],
             "top_score": top_score,
             "refused_at": "threshold",

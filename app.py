@@ -80,7 +80,7 @@ client = _load_groq_client()
 st.title("Clinical Trial Intelligence")
 st.caption(
     "RAG over 484 ClinicalTrials.gov studies (oncology, diabetes, cardiovascular). "
-    "PubMedBERT embeddings, FAISS retrieval, Groq Llama 3.3 70B, LangGraph orchestration."
+    "PubMedBERT embeddings, FAISS retrieval, Groq GPT-OSS 120B, LangGraph orchestration."
 )
 
 

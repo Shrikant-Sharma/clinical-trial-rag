@@ -62,7 +62,7 @@ flowchart LR
     RR --> DD[Dedup by NCT ID<br/>top-5 unique trials]
     DD --> GR[LLM-as-judge grades documents]
     GR --> G2{Gate 2<br/>relevant?}
-    G2 -->|yes| GEN[Llama 3.3 70B<br/>generate grounded answer]
+    G2 -->|yes| GEN[GPT-OSS 120B via Groq<br/>generate grounded answer]
     G2 -->|retry| RW[Rewrite query]
     RW --> R
     G2 -->|exhausted| REF
@@ -93,7 +93,7 @@ flowchart LR
     R --> DD[Dedup by NCT ID<br/>keep top-5 unique trials]
     DD --> L1{Cosine ≥ 0.50?}
     L1 -->|no| REF1[Layer 1 refusal<br/>backstop]
-    L1 -->|yes| L2[Llama 3.3 70B<br/>+ refusal clause in system prompt]
+    L1 -->|yes| L2[GPT-OSS 120B via Groq<br/>+ refusal clause in system prompt]
     L2 --> OUT[Cited answer<br/>or scope-aware refusal]
 ```
 
@@ -144,7 +144,7 @@ chosen for two reasons: it runs locally with no per-query cost, and the
 `pritamdeka/S-PubMedBert-MS-MARCO` variant is specifically tuned for retrieval
 rather than general semantic similarity.
 
-### Groq Llama 3.3 70B as the generator
+### Groq GPT-OSS 120B as the generator
 
 Free tier, OpenAI-compatible API, fast enough for an interactive UI
 (typically 1 to 2 seconds per answer). The model name is parameterized in
@@ -152,8 +152,29 @@ Free tier, OpenAI-compatible API, fast enough for an interactive UI
 version with no warning:
 
 ```python
-LLM_MODEL = "llama-3.3-70b-versatile"
+LLM_MODEL = "openai/gpt-oss-120b"
+LLM_EXTRA_BODY = {"reasoning_effort": "low", "include_reasoning": False}
 ```
+
+That parameterization paid for itself a second time. The system was built
+and evaluated on `llama-3.3-70b-versatile`; Groq decommissioned that model
+on August 16, 2026, and the live demo went down with a `NotFoundError`
+(caught by the app's error handler rather than a traceback). The swap to
+Groq's recommended replacement, `openai/gpt-oss-120b`, touched one
+constant plus one adjustment the new model class required: GPT-OSS is a
+reasoning model that spends tokens thinking before it answers, and those
+tokens come out of the same `max_tokens` budget as the answer. The
+document grader's old cap of 10 tokens ("one-word answer") would have been
+consumed entirely by reasoning, returned empty content, and turned the
+grading gate into a silent no-op through its fail-open default. Every call
+site now sets `reasoning_effort="low"` and a cap with headroom, and an
+empty response maps onto the canonical refusal phrase so the system fails
+closed.
+
+**All evaluation numbers in this README were measured with Llama 3.3 70B
+as both generator and judge, before the decommission.** The retrieval
+stack (PubMedBERT, FAISS, cross-encoder reranker) and the safety
+architecture are unchanged; only the generator behind them is different.
 
 The system prompt is model-portable. Swap in any chat model that takes a
 `messages` parameter and the rest of the pipeline is unchanged.
@@ -576,7 +597,8 @@ separators, same min-chunk filter), then evaluated end-to-end.
 Six in-corpus queries plus four adversarial queries, each through the full
 RAG pipeline at all three chunk sizes (30 runs total). The 18 in-corpus runs
 were scored on three RAGAS-equivalent metrics, judged by the same
-Llama 3.3 70B used for generation:
+Llama 3.3 70B that served as generator at the time (see the generator
+section above for the later model swap):
 
 - **Faithfulness**: percentage of atomic claims in the answer supported by
   the retrieved context (claims decomposed by LLM, each verified against context)
@@ -814,14 +836,28 @@ intuition: halving the refusal rate without touching the bi-encoder, by
 adding a model class that can do something the bi-encoder structurally
 cannot.
 
+**The hosted LLM is the least stable component in the system.** Groq
+deprecated the generator twice in five months. The first time, mid-build,
+cost an afternoon and produced the parameterized `LLM_MODEL` constant.
+The second time, after the project was "done" and linked from a resume,
+the live demo was down for anyone who clicked through until the swap
+landed. Three things made the recovery small: the model name lived in one
+place, the error handler turned the failure into a readable message
+instead of a traceback, and the refusal detection keyed on a phrase the
+system prompt dictates rather than on anything model-specific. What it
+still cost was a model-class change: the replacement is a reasoning
+model, so every `max_tokens` cap had to be re-examined because reasoning
+tokens now share the budget. A portfolio project with a live demo is a
+small production system, and its external dependencies will move.
+
 ---
 
 ## Tech stack
 
 Python 3.13, sentence-transformers (PubMedBERT bi-encoder + MS-MARCO
-cross-encoder reranker), FAISS, Groq API, LangGraph (agentic
-orchestration), LangChain text splitters (recursive chunking only),
-Streamlit, pandas.
+cross-encoder reranker), FAISS, Groq API (`openai/gpt-oss-120b`;
+originally Llama 3.3 70B), LangGraph (agentic orchestration), LangChain
+text splitters (recursive chunking only), Streamlit, pandas.
 
 ---
 
@@ -853,10 +889,14 @@ Reproduce the chunking sweep (and the Phase 3 reranker comparison in Step D):
 jupyter notebook notebooks/03_chunking_sweep.ipynb
 ```
 
-A free Groq API key is sufficient to run the system. The full chunking-sweep
-evaluation uses approximately 100,000 tokens which fits inside the daily
-free-tier budget if run in a single session; the Phase 3 reranker comparison
-in Step D adds approximately 40,000 tokens on top, so plan accordingly.
+A free Groq API key is sufficient to run the system. The evaluation
+notebooks were run on Llama 3.3 70B, where the full chunking sweep used
+approximately 100,000 tokens and the Phase 3 reranker comparison in Step D
+added roughly 40,000 more. On `openai/gpt-oss-120b` expect higher counts,
+since reasoning tokens are billed alongside the answer, and check the
+current free-tier daily limit for the model at
+https://console.groq.com/settings/limits before a full re-run. Groq's
+daily limit is a rolling 24-hour window, not a midnight reset.
 
 ---
 

@@ -7,7 +7,7 @@ rewrites the query and retries on poor retrieval, and falls back to an
 honest refusal when retries are exhausted.
 
 Design choices:
-- Core retrieval (FAISS + PubMedBERT) and generation (Groq Llama 3.3 70B)
+- Core retrieval (FAISS + PubMedBERT) and generation (Groq, see rag.LLM_MODEL)
   live in rag.py and are LangChain-free. LangGraph only orchestrates.
 - The two-layer safety from rag.generate() is preserved: the similarity
   threshold catches catastrophic OOD queries; the LLM refusal clause is the
@@ -27,7 +27,10 @@ from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
 
-from src.rag import retrieve, DEFAULT_THRESHOLD, build_context, generate_answer, LLM_MODEL
+from src.rag import (
+    retrieve, DEFAULT_THRESHOLD, build_context, generate_answer,
+    LLM_MODEL, LLM_EXTRA_BODY,
+)
 
 
 # ---- Config ----
@@ -200,9 +203,14 @@ def _grade_documents(state: AgentState, client) -> dict:
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,   # Deterministic for grading.
-        max_tokens=10,     # One word answer.
+        # The answer is one word, but GPT-OSS spends reasoning tokens from
+        # this same budget before emitting it. The old cap of 10 would have
+        # been consumed by reasoning, returned empty content, and turned
+        # this gate into a silent no-op via the fail-open default below.
+        max_tokens=256,
+        extra_body=LLM_EXTRA_BODY,
     )
-    output = response.choices[0].message.content.strip().lower()
+    output = (response.choices[0].message.content or "").strip().lower()
 
     # Normalize: check "not_relevant" before "relevant" since both contain
     # the substring "relevant".
@@ -234,9 +242,13 @@ def _rewrite_query(state: AgentState, client) -> dict:
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
-        max_tokens=100,
+        max_tokens=256,    # Reasoning tokens share this budget on GPT-OSS.
+        extra_body=LLM_EXTRA_BODY,
     )
-    new_query = response.choices[0].message.content.strip()
+    # If the rewrite comes back empty, keep the current query rather than
+    # retrieving on an empty string; retry_count still advances so the
+    # loop stays bounded.
+    new_query = (response.choices[0].message.content or "").strip() or state["current_query"]
 
     return {
         "current_query": new_query,
